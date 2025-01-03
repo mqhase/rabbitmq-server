@@ -10,7 +10,9 @@
          display_help/1,
          start_record_stream/4,
          push_new_record/3,
-         end_record_stream/2]).
+         end_record_stream/2,
+         read_file/3,
+         write_file/4]).
 -export([init/1,
          handle_call/3,
          handle_cast/2,
@@ -39,7 +41,7 @@ argparse_def(record_stream) ->
          long => "-output",
          short => $o,
          type => string,
-         nargs => 1,
+         default => "-",
          help => "Write output to file <FILE>"},
        #{name => format,
          long => "-format",
@@ -47,6 +49,28 @@ argparse_def(record_stream) ->
          type => {atom, [plain, json]},
          default => plain,
          help => "Format output acccording to <FORMAT>"}
+      ]
+     };
+argparse_def(file_input) ->
+    #{arguments =>
+      [
+       #{name => input,
+         long => "-input",
+         short => $i,
+         type => string,
+         default => "-",
+         help => "Read input from file <FILE>"}
+      ]
+     };
+argparse_def(file_output) ->
+    #{arguments =>
+      [
+       #{name => output,
+         long => "-output",
+         short => $o,
+         type => string,
+         default => "-",
+         help => "Write output to file <FILE>"}
       ]
      }.
 
@@ -74,6 +98,22 @@ end_record_stream({transport, Transport}, #{name := Name}) ->
 end_record_stream(IO, #{name := Name}) ->
     gen_server:cast(IO, {?FUNCTION_NAME, Name}).
 
+read_file({transport, Transport}, ArgMap, Options) ->
+    Transport ! {io_call, self(), {?FUNCTION_NAME, ArgMap, Options}},
+    receive Ret -> Ret end;
+read_file(IO, ArgMap, Options)
+  when is_pid(IO) andalso
+       is_map(ArgMap) ->
+    gen_server:call(IO, {?FUNCTION_NAME, ArgMap, Options}).
+
+write_file({transport, Transport}, ArgMap, Content, Options) ->
+    Transport ! {io_call, self(), {?FUNCTION_NAME, ArgMap, Content, Options}},
+    receive Ret -> Ret end;
+write_file(IO, ArgMap, Content, Options)
+  when is_pid(IO) andalso
+       is_map(ArgMap) ->
+    gen_server:call(IO, {?FUNCTION_NAME, ArgMap, Content, Options}).
+
 init(#{progname := Progname}) ->
     process_flag(trap_exit, true),
     State = #?MODULE{progname = Progname},
@@ -91,6 +131,12 @@ handle_call(
     {ok, State2} = format_record_stream_start(Name, State1),
 
     {noreply, State2};
+handle_call({read_file, ArgMap, Options}, From, State) ->
+    {ok, State1} = do_read_file(ArgMap, Options, From, State),
+    {noreply, State1};
+handle_call({write_file, ArgMap,  Content, Options}, From, State) ->
+    {ok, State1} = do_write_file(ArgMap, Content, Options, From, State),
+    {noreply, State1};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 handle_call(_Request, _From, State) ->
@@ -248,4 +294,58 @@ isatty(IoDevice) ->
             true;
         _ ->
             false
+    end.
+
+do_read_file(#{input := "-"}, Options, From, State) ->
+    IoDevice = standard_io,
+    Opts = io:getopts(IoDevice),
+    IsBinary = proplists:get_value(binary, Opts),
+    IsBinary orelse (ok = io:setopts(IoDevice, [{binary, true}])),
+    try
+        do_read_file1(standard_io, <<>>, Options, From, State)
+    after
+        IsBinary orelse (ok = io:setopts(IoDevice, [{binary, false}]))
+    end;
+do_read_file(#{input := Filename}, Options, From, State) ->
+    Modes = [read, raw, read_ahead, binary],
+    case file:open(Filename, Modes) of
+        {ok, IoDevice} ->
+            try
+                do_read_file1(IoDevice, <<>>, Options, From, State)
+            after
+                file:close(IoDevice)
+            end;
+        {error, _} = Error ->
+            gen_server:reply(From, Error),
+            {ok, State}
+    end.
+
+do_read_file1(IoDevice, Buffer, Options, From, State) ->
+    case file:read(IoDevice, 4096) of
+        {ok, Binary} when is_binary(Binary) ->
+            Buffer1 = <<Buffer/binary, Binary/binary>>,
+            do_read_file1(IoDevice, Buffer1, Options, From, State);
+        eof ->
+            gen_server:reply(From, {ok, Buffer}),
+            {ok, State};
+        {error, _} = Error ->
+            gen_server:reply(From, Error),
+            {ok, State}
+    end.
+
+do_write_file(#{output := "-"}, Content, _Options, From, State) ->
+    IoDevice = standard_io,
+    Ret = file:write(IoDevice, Content),
+    gen_server:reply(From, Ret),
+    {ok, State};
+do_write_file(#{output := Filename}, Content, _Options, From, State) ->
+    Modes = [write, raw, binary],
+    case file:open(Filename, Modes) of
+        {ok, IoDevice} ->
+            Ret = file:write(IoDevice, Content),
+            gen_server:reply(From, Ret),
+            {ok, State};
+        {error, _} = Error ->
+            gen_server:reply(From, Error),
+            {ok, State}
     end.
